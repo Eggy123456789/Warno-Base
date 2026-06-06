@@ -1,4 +1,4 @@
-# WARNO Infantry Analysis
+# WARNO Infantry Analysis (Updated to Nemesis 7 Patch, v193438)
 
 A Python tool that analyzes WARNO infantry (for now) units and ranks them based on combat effectiveness and value.
 
