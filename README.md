@@ -11,43 +11,45 @@ WARNO contains hundreds of infantry units with varying squad sizes, weapons, and
 - Survivability
 - Cost efficiency
 
-We will not perfectly simulate every unique in-game interaction, but this project does aim to provide a generalist ranking that will mostly hold up.
+The goal is to create a consistent and reasonably accurate comparison of infantry units under standardized combat conditions.
 
-Currently, this project only focuses on infantry units and their anti-infantry effectiveness, but I do plan to expand this into other unit types/purposes.
+Currently, this project focuses only on infantry and their anti-infantry effectiveness, though I plan to expand it to additional unit types in the future.
 
 ---
 
-## Features
+# Features
 
-### Infantry Categories
+## Infantry Categories
 
-The script generates rankings for three categories:
+The script generates rankings for three categories.
 
-#### All Infantry
+### All Infantry
 
-Includes all infantry-class units, including:
+Includes every infantry-class unit, including:
 
 - Infantry squads
-- Some mortar teams (I think?)
+- Mortar teams
 - MANPADS
 - ATGM teams
 - Gun crews
+- Command infantry
 
-#### Actual Infantry
+### Actual Infantry
 
-Attempts to isolate true infantry squads.
+Attempts to isolate combat infantry.
 
 Requirements:
 
-- Squad size of at least 4. There is probably a better way to do this, but I'm too lazy.
+- Squad size of at least 4
+- Excludes command infantry (`hq_inf`)
 
-#### Infantry with AT
+### Infantry with AT
 
 Actual infantry squads that also possess an anti-tank weapon.
 
 ---
 
-## Combat Score
+# Combat Score
 
 Combat Score is a weighted combination of:
 
@@ -67,94 +69,114 @@ CombatScore =
 Where:
 
 ```text
-NormalizedSuppression = SquadSuppression / 118.2
+NormalizedSuppression = SquadSuppression / 141.65
 NormalizedHP = HP / 16
 ```
 
-(118.2 and 16 are the highest values observed in the infantry dataset.)
+(141.65 and 16 are the highest values observed in the infantry dataset.)
 
 ---
 
-## Effective DPS
+# Effective DPS
 
-Effective DPS is calculated per weapon:
+Effective DPS is evaluated at a standardized engagement distance of **500 meters**. I'll probably add 850 meters later.
+
+Each weapon contributes:
 
 ```text
 EffectiveDPS =
 (NumberOfWeapons × HEDamage × TrueRateOfFire / 60)
 × Accuracy
-× RangeFactor
 ```
 
----
+Unlike previous versions, no range multiplier is applied.
 
-## Range Adjustment
+Weapons only contribute if:
 
-Short-range weapons receive a range penalty.
-
-850m is treated as the standard infantry engagement range.
-
-The penalty increases below roughly 400m and then levels off.
-
-| Range | Factor |
-|--------|---------|
-| 850m | 1.00 |
-| 700m | ~0.97 |
-| 500m | ~0.92 |
-| 400m | ~0.90 |
-| 300m | ~0.84 |
-| 150m | ~0.74 |
-
-Special close-assault weapons such as satchel charges, flamethrowers, and RPO launchers are protected from excessive penalties. I'm not sure if this is a good idea or not.
+- 500m lies between their minimum and maximum ground range
+- They are not designated close-assault weapons
 
 ---
 
-## Veterancy and Special Traits
+# Accuracy Calculation
 
-The script currently models:
+Accuracy is evaluated using each weapon's **ground static accuracy**.
 
-### Reservists
+If a weapon provides a `staticAccuracyOverDistance` table:
 
--5 Accuracy
+- If 500m exactly exists, that value is used.
+- Otherwise, the two nearest distances are averaged.
 
-### Militia
+After all veterancy and specialty bonuses are applied:
 
-Approximately 16.7% lower rate of fire
+- Accuracy is capped between **0% and 100%**.
 
-### Special Forces
+No additional bonuses are awarded above 100%.
+
+---
+
+# Shock Combat Score
+
+Shock Combat Score estimates performance during close-range engagements.
+
+It is calculated using the same Combat Score formula, except weapon performance is evaluated at **150 meters**.
+
+- Shock infantry (`_choc`) receive their bonuses:
+  - +15% HE damage
+  - Approximately +17.6% rate of fire (derived from 15% faster reload and firing animations)
+
+The exported CSV includes:
+
+- ShockCombatScore
+- ShockValueScore
+- ShockRank
+- ShockValueRank
+
+---
+
+# Veterancy and Special Traits
+
+The script currently models the following known modifiers.
+
+## Reservists
+
+- -5 Accuracy
+
+## Militia
+
+- Approximately 16.7% lower rate of fire
+
+## Special Forces
 
 Assumed to receive:
 
 - +12 Accuracy
 - +20% Rate of Fire
 
-This approximates the effects of 2-veterancy special forces.
+This approximates two veterancy levels.
 
-### Rangers
+## Shock Infantry
 
-Treated separately:
-
-- +8 Accuracy
-- +10% Rate of Fire
-
-This approximates 1-veterancy units.
+Units possessing the `_choc` specialty receive bonuses when calculating Shock Combat Score only.
 
 ---
 
-## Value Score
+# Value Score
 
 ```text
 ValueScore =
-CombatScore / CommandPoints
+(CombatScore / CommandPoints) × 100
 ```
 
-(Command Points are how much it costs to deploy a unit, excluding transports.)
+(Command Points are the deployment cost of the unit, excluding transports.)
 
-This measures combat effectiveness per point spent.
+Multiplying by 100 simply makes the values easier to read.
+
+Shock Value Score is calculated identically using Shock Combat Score.
 
 ---
 
-## Output
+# Output
 
 The script exports:
 
@@ -166,25 +188,37 @@ Each CSV includes:
 
 - CombatRank
 - ValueRank
-- Unit Name
+- ShockRank
+- ShockValueRank
+- Unit
 - Cost
 - HP
+- NormalizedHP
 - EffectiveDPS
 - Suppression
+- NormalizedSuppression
+- ShockDPS
+- ShockSuppression
+- ShockNormalizedSuppression
+- ATScore
 - CombatScore
 - ValueScore
+- ShockCombatScore
+- ShockValueScore
 
 ---
 
-## Limitations
+# Limitations
 
 This project does not currently model:
 
-- Base veterancy of non-special-forces units (e.g. AERO-RIFLES)
-- Moving accuracy (yet!)
-- Shock bonuses (yet!)
+- Base veterancy of most units
 - Morale mechanics
+- Suppression recovery
 - Availability
 - Transport options
+- Terrain
+- Cover
+- Ammunition limits
 
-As a result, the rankings should be interpreted as comparative indicators
+As a result, the rankings should be interpreted as comparative indicators rather than exact predictions of in-game performance.
