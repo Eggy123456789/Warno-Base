@@ -3,25 +3,29 @@ import csv
 from statistics import mean
 from pathlib import Path
 import os
-# ==========================================================
-# TO DO:
-# Adjust suppression, sometimes it can be overwhelming DONE?
-# Prob filter different range brackets (remember shock trait)
-# Do smth about AT score
-# moving score, i.e. "stabilizer"
-# LIMITATION: cant account for base veterancy for non SF "shock" units i.e. AERO-RIFLES
-# ==========================================================
-print("Current working directory:")
-print(os.getcwd())
 
 # ==========================================================
-# FILE PATHS/CONSTANTS
+# FILE PATHS / CONSTANTS
 # ==========================================================
+
+print("Current working directory:")
+print(os.getcwd())
 
 BASE_DIR = Path(__file__).parent
 
 WEAPONS_FILE = BASE_DIR / "weapons.json"
 UNITS_FILE = BASE_DIR / "units.json"
+OUTPUT_FOLDER = BASE_DIR
+
+NORMAL_RANGE = 500
+SHOCK_RANGE = 150
+
+SUPPRESSION_MAX = 141.65
+HP_MAX = 16
+
+DPS_WEIGHT = 0.45
+SUPPRESSION_WEIGHT = 0.20
+HP_WEIGHT = 0.35
 
 # ==========================================================
 # LOAD DATA
@@ -47,7 +51,7 @@ for unit in unit_data:
     if unit.get("infoPanelType") != "infantry":
         continue
 
-    # Exclude units not currently available in any division
+    # Exclude removed/upcoming units with no division availability
     if not unit.get("divisions"):
         continue
 
@@ -69,55 +73,90 @@ for unit in unit_data:
 print(f"Found {len(cost_lookup)} infantry entries")
 
 # ==========================================================
-# HELPERS
+# HELPER FUNCTIONS
 # ==========================================================
 
-def average_accuracy(ammo):
+def can_fire_at_range(ammo, target_range):
+    weapon_min = ammo.get("groundMinRange", 0)
+    weapon_max = ammo.get("groundMaxRange", 0)
 
-    try:
-        ground = ammo["staticAccuracyOverDistance"]["ground"]
+    return weapon_min <= target_range <= weapon_max
 
-        if len(ground) == 0:
-            return ammo.get("staticAccuracy", 0) / 100
 
-        return mean(x["accuracy"] for x in ground) / 100
+def accuracy_at_range(ammo, target_range, accuracy_bonus=0):
+    """
+    Uses static ground accuracy.
 
-    except:
-        return ammo.get("staticAccuracy", 0) / 100
+    If the weapon has a ground accuracy table:
+    - exact target range match = use that value
+    - otherwise average the two closest distance points
 
-def range_factor(ammo):
+    If no table exists:
+    - use staticAccuracy
 
-    STANDARD_RANGE = 850
-    LEVEL_OFF_RANGE = 400
+    Accuracy is capped between 0% and 100%.
+    """
 
-    weapon_range = ammo.get("groundMaxRange", 0)
+    accuracy_table = ammo.get(
+        "staticAccuracyOverDistance",
+        {}
+    ).get("ground")
 
-    if weapon_range <= 0:
-        return 0
-
-    # Full effectiveness for long-range infantry weapons
-    if weapon_range >= STANDARD_RANGE:
-        return 1.0
-
-    # Sharper penalty below 400m
-    if weapon_range <= LEVEL_OFF_RANGE:
-
-        factor = 0.65 + 0.25 * (
-            weapon_range / LEVEL_OFF_RANGE
-        )
-
-    # Above 400m, penalty mostly levels off
+    if not accuracy_table:
+        accuracy = ammo.get("staticAccuracy", 0)
     else:
+        exact_match = [
+            x["accuracy"]
+            for x in accuracy_table
+            if x["distance"] == target_range
+        ]
 
-        factor = 0.90 + 0.10 * (
-            (weapon_range - LEVEL_OFF_RANGE)
-            / (STANDARD_RANGE - LEVEL_OFF_RANGE)
-        )
+        if exact_match:
+            accuracy = exact_match[0]
+        else:
+            closest = sorted(
+                accuracy_table,
+                key=lambda x: abs(x["distance"] - target_range)
+            )[:2]
 
-    # Protect close-assault weapons
+            accuracy = mean(x["accuracy"] for x in closest)
+
+    accuracy += accuracy_bonus
+    accuracy = max(0, min(100, accuracy))
+
+    return accuracy / 100
+
+
+def is_close_assault_weapon(ammo):
+    """
+    Weapons excluded from normal 500m DPS, but included in shock/close-range DPS.
+    """
+
     ammo_name = ammo.get("name", "").lower()
+    descriptor = ammo.get("descriptorName", "").lower()
+    minmax = ammo.get("minMaxCategory", "").lower()
 
-    assault_keywords = [
+    close_keywords = [
+        "this should not be used"
+    ]
+
+    return (
+        any(word in ammo_name for word in close_keywords)
+        or any(word in descriptor for word in close_keywords)
+        or "shotgun" in minmax
+    )
+
+
+def is_special_assault_weapon(ammo):
+    """
+    Weapons that may have HEAT/penetration values but should not be classified
+    as real AT weapons.
+    """
+
+    ammo_name = ammo.get("name", "").lower()
+    descriptor = ammo.get("descriptorName", "").lower()
+
+    excluded_at_keywords = [
         "satchel",
         "rpo",
         "flame",
@@ -125,52 +164,105 @@ def range_factor(ammo):
         "lpo"
     ]
 
-    if any(word in ammo_name for word in assault_keywords):
-        factor = max(factor, 0.90)
+    return (
+        any(word in ammo_name for word in excluded_at_keywords)
+        or any(word in descriptor for word in excluded_at_keywords)
+    )
 
-    return factor
+
+def is_at_weapon(ammo):
+    penetration = ammo.get("penetration", 0)
+
+    return (
+        penetration > 2
+        and not is_special_assault_weapon(ammo)
+    )
+
 
 def get_unit_modifiers(unit_name, specialities):
+    """
+    Applies known unit-wide modifiers.
+
+    Reservist:
+    -5 accuracy
+
+    Militia:
+    normal units have 20% more ROF than militia,
+    so militia is modeled as 1/1.20 ROF.
+
+    Special Forces:
+    assumed 2-vet
+    +12 accuracy
+    +20% ROF
+
+    Rangers:
+    treated as 1-vet
+    +8 accuracy
+    +10% ROF
+    """
 
     accuracy_bonus = 0
     rof_multiplier = 1.0
 
-    # Reservists: -5 accuracy
     if "_reservist" in specialities:
         accuracy_bonus -= 5
 
-    # Militia: normal units fire 20% faster than militia, so militia has 1 / 1.20 of normal ROF. i think?
     if "_militia" in specialities:
         rof_multiplier *= 1 / 1.20
 
-    # Most special forces: +12 accuracy, +20% ROF. im not going to implement the 3 vet guys bc lazy
     if "_sf" in specialities:
         accuracy_bonus += 12
         rof_multiplier *= 1.20
 
-    # Rangers exception: +8 accuracy, +10% ROF
     if "ranger" in unit_name.lower():
         accuracy_bonus = 8
         rof_multiplier = 1.10
 
     return accuracy_bonus, rof_multiplier
 
-def weapon_stats(weapon, accuracy_bonus=0, rof_multiplier=1.0):
 
+def weapon_stats(
+    weapon,
+    target_range,
+    accuracy_bonus=0,
+    rof_multiplier=1.0,
+    include_close_assault=False,
+    apply_shock=False
+):
     ammo = weapon["ammo"]
 
     count = weapon.get("numberOfWeapons", 1)
 
+    if not can_fire_at_range(ammo, target_range):
+        return {
+            "effective_dps": 0,
+            "suppression": 0,
+            "at_score": 0,
+            "count": count
+        }
+
+    if is_close_assault_weapon(ammo) and not include_close_assault:
+        return {
+            "effective_dps": 0,
+            "suppression": 0,
+            "at_score": 0,
+            "count": count
+        }
+
     he = ammo.get("heDamage", 0)
-
     rof = ammo.get("trueRateOfFire", 0) * rof_multiplier
-
     suppress = ammo.get("suppress", 0)
-
-    accuracy = average_accuracy(ammo)
-    accuracy = max(0, accuracy + accuracy_bonus / 100)
-
     penetration = ammo.get("penetration", 0)
+
+    if apply_shock:
+        he *= 1.15
+        rof *= 1 / 0.85
+
+    accuracy = accuracy_at_range(
+        ammo,
+        target_range,
+        accuracy_bonus
+    )
 
     effective_dps = (
         count
@@ -178,7 +270,6 @@ def weapon_stats(weapon, accuracy_bonus=0, rof_multiplier=1.0):
         * rof
         / 60
         * accuracy
-        * range_factor(ammo)
     )
 
     suppression = (
@@ -203,6 +294,15 @@ def weapon_stats(weapon, accuracy_bonus=0, rof_multiplier=1.0):
         "count": count
     }
 
+
+def calculate_combat_score(dps, normalized_suppression, normalized_hp):
+    return (
+        dps * DPS_WEIGHT
+        + normalized_suppression * SUPPRESSION_WEIGHT
+        + normalized_hp * HP_WEIGHT
+    )
+
+
 # ==========================================================
 # RESULT LISTS
 # ==========================================================
@@ -220,167 +320,174 @@ for descriptor_name, squad in weapon_data.items():
     if descriptor_name not in cost_lookup:
         continue
 
-    squad_dps = 0
-    squad_suppression = 0
-    squad_at_score = 0
-    squad_size = 0
-
-    small_arms_count = 0
-    has_at_weapon = False
-
     unit_name = cost_lookup[descriptor_name]["name"]
+    cost = cost_lookup[descriptor_name]["cost"]
+    hp = cost_lookup[descriptor_name]["hp"]
     specialities = cost_lookup[descriptor_name]["specialities"]
+
+    is_shock = "_choc" in specialities
+
+    is_hq_infantry = (
+        "hq_inf" in specialities
+        or "_hq_inf" in specialities
+    )
 
     accuracy_bonus, rof_multiplier = get_unit_modifiers(
         unit_name,
         specialities
     )
 
+    squad_dps = 0
+    squad_suppression = 0
+
+    shock_dps = 0
+    shock_suppression = 0
+
+    squad_at_score = 0
+    squad_size = 0
+    small_arms_count = 0
+    has_at_weapon = False
+
     for weapon in squad.get("weapons", []):
 
         ammo = weapon["ammo"]
 
-        stats = weapon_stats(
+        normal_stats = weapon_stats(
             weapon,
-            accuracy_bonus,
-            rof_multiplier
+            target_range=NORMAL_RANGE,
+            accuracy_bonus=accuracy_bonus,
+            rof_multiplier=rof_multiplier,
+            include_close_assault=False,
+            apply_shock=False
         )
 
-        squad_size += stats["count"]
-
-        penetration = ammo.get("penetration", 0)
-
-        # AT weapon detection
-        ammo_name = ammo.get("name", "").lower()
-
-        excluded_at_keywords = [
-            "satchel",
-            "rpo",
-            "flame",
-            "flam"
-        ]
-
-        is_special_assault_weapon = any(
-            word in ammo_name
-            for word in excluded_at_keywords
+        shock_stats = weapon_stats(
+            weapon,
+            target_range=SHOCK_RANGE,
+            accuracy_bonus=accuracy_bonus,
+            rof_multiplier=rof_multiplier,
+            include_close_assault=True,
+            apply_shock=is_shock
         )
 
-        is_at_weapon = (
-            penetration > 2
-            and not is_special_assault_weapon
-        )
+        squad_size += normal_stats["count"]
 
-        if is_at_weapon:
+        if is_at_weapon(ammo):
             has_at_weapon = True
-            squad_at_score += stats["at_score"]
+            squad_at_score += normal_stats["at_score"]
         else:
-            squad_dps += stats["effective_dps"]
-            squad_suppression += stats["suppression"]
+            squad_dps += normal_stats["effective_dps"]
+            squad_suppression += normal_stats["suppression"]
 
-        # Small arms detection
+            shock_dps += shock_stats["effective_dps"]
+            shock_suppression += shock_stats["suppression"]
+
+        # Used only for rough filtering of "real" infantry
         if (
-            penetration == 0
+            not is_at_weapon(ammo)
             and ammo.get("trueRateOfFire", 0) > 15
+            and not is_close_assault_weapon(ammo)
         ):
-            small_arms_count += stats["count"]
+            small_arms_count += normal_stats["count"]
 
-    cost = cost_lookup[descriptor_name]["cost"]
-    hp = cost_lookup[descriptor_name]["hp"]
+    normalized_suppression = squad_suppression / SUPPRESSION_MAX
+    shock_normalized_suppression = shock_suppression / SUPPRESSION_MAX
+    normalized_hp = hp / HP_MAX
 
-    
-    normalized_suppression = squad_suppression / 118.2 #118.2 is the max suppression value found
-    normalized_hp = hp / 16 #max HP value found
+    combat_score = calculate_combat_score(
+        squad_dps,
+        normalized_suppression,
+        normalized_hp
+    )
 
-    combat_score = (
-        squad_dps * 0.45
-        + normalized_suppression * 0.20
-        + normalized_hp * 0.35
+    shock_combat_score = calculate_combat_score(
+        shock_dps,
+        shock_normalized_suppression,
+        normalized_hp
     )
 
     value_score = (
-        combat_score / cost
+        (combat_score / cost) * 100
+        if cost > 0
+        else 0
+    )
+
+    shock_value_score = (
+        (shock_combat_score / cost) * 100
         if cost > 0
         else 0
     )
 
     row = {
-        "Unit": cost_lookup[descriptor_name]["name"],
+        "Unit": unit_name,
         "Cost": cost,
-        #"SquadSize": squad_size, NOT CORRECT
         "SmallArms": small_arms_count,
         "HP": hp,
         "NormalizedHP": round(normalized_hp, 4),
-        "EffectiveDPS": round(squad_dps, 3),
 
+        "EffectiveDPS": round(squad_dps, 3),
         "Suppression": round(squad_suppression, 2),
         "NormalizedSuppression": round(normalized_suppression, 4),
+
+        "ShockDPS": round(shock_dps, 3),
+        "ShockSuppression": round(shock_suppression, 2),
+        "ShockNormalizedSuppression": round(
+            shock_normalized_suppression,
+            4
+        ),
 
         "ATScore": round(squad_at_score, 2),
 
         "CombatScore": round(combat_score, 4),
-        "ValueScore": round(value_score, 4)
+        "ValueScore": round(value_score, 4),
+
+        "IsShock": is_shock,
+        "ShockCombatScore": round(shock_combat_score, 4),
+        "ShockValueScore": round(shock_value_score, 4)
     }
-    
-    # ------------------------------------------------------
-    # ALL INFANTRY
-    # ------------------------------------------------------
 
     all_infantry.append(row)
 
-    # ------------------------------------------------------
-    # ACTUAL INFANTRY
-    # ------------------------------------------------------
-
     is_actual_infantry = (
         squad_size >= 4
-        and small_arms_count >= 4
     )
 
-    if is_actual_infantry:
+    if is_actual_infantry and not is_hq_infantry:
         actual_infantry.append(row)
 
-    # ------------------------------------------------------
-    # ACTUAL INFANTRY WITH AT
-    # ------------------------------------------------------
-
-    if is_actual_infantry and has_at_weapon:
+    if is_actual_infantry and has_at_weapon and not is_hq_infantry:
         infantry_with_at.append(row)
+
+# ==========================================================
+# DATASET RANGES
+# ==========================================================
 
 print("\n===== DATASET RANGES =====")
 
-print(
-    "Max DPS:",
-    max(row["EffectiveDPS"] for row in actual_infantry)
-)
+if actual_infantry:
+    print("Max DPS:", max(row["EffectiveDPS"] for row in actual_infantry))
+    print("Max Suppression:", max(row["Suppression"] for row in actual_infantry))
+    print("Max Shock DPS:", max(row["ShockDPS"] for row in actual_infantry))
+    print("Max Shock Suppression:", max(row["ShockSuppression"] for row in actual_infantry))
+    print("Max HP:", max(row["HP"] for row in actual_infantry))
 
-print(
-    "Max Suppression:",
-    max(row["Suppression"] for row in actual_infantry)
-)
+    print(
+        "Average DPS:",
+        sum(row["EffectiveDPS"] for row in actual_infantry)
+        / len(actual_infantry)
+    )
 
-print(
-    "Max HP:",
-    max(row["HP"] for row in actual_infantry)
-)
+    print(
+        "Average Suppression:",
+        sum(row["Suppression"] for row in actual_infantry)
+        / len(actual_infantry)
+    )
 
-print(
-    "Average DPS:",
-    sum(row["EffectiveDPS"] for row in actual_infantry)
-    / len(actual_infantry)
-)
-
-print(
-    "Average Suppression:",
-    sum(row["Suppression"] for row in actual_infantry)
-    / len(actual_infantry)
-)
-
-print(
-    "Average HP:",
-    sum(row["HP"] for row in actual_infantry)
-    / len(actual_infantry)
-)
-
+    print(
+        "Average HP:",
+        sum(row["HP"] for row in actual_infantry)
+        / len(actual_infantry)
+    )
 
 # ==========================================================
 # PRINT TOP 20
@@ -390,7 +497,7 @@ def print_rankings(title, data):
 
     print(f"\n{'=' * 70}")
     print(title)
-    print('=' * 70)
+    print("=" * 70)
 
     print("\nTOP 20 BY COMBAT SCORE\n")
 
@@ -404,7 +511,7 @@ def print_rankings(title, data):
         print(
             f"{row['Unit'][:35]:35} "
             f"Cost={row['Cost']:3} "
-            f"Combat={row['CombatScore']:8.2f} "
+            f"Combat={row['CombatScore']:8.4f} "
             f"Value={row['ValueScore']:.4f}"
         )
 
@@ -420,8 +527,24 @@ def print_rankings(title, data):
         print(
             f"{row['Unit'][:35]:35} "
             f"Cost={row['Cost']:3} "
-            f"Combat={row['CombatScore']:8.2f} "
+            f"Combat={row['CombatScore']:8.4f} "
             f"Value={row['ValueScore']:.4f}"
+        )
+
+    print("\nTOP 20 BY SHOCK COMBAT SCORE\n")
+
+    by_shock = sorted(
+        data,
+        key=lambda x: x["ShockCombatScore"],
+        reverse=True
+    )
+
+    for row in by_shock[:20]:
+        print(
+            f"{row['Unit'][:35]:35} "
+            f"Cost={row['Cost']:3} "
+            f"Shock={row['ShockCombatScore']:8.4f} "
+            f"ShockValue={row['ShockValueScore']:.4f}"
         )
 
 
@@ -432,8 +555,6 @@ print_rankings("INFANTRY WITH AT", infantry_with_at)
 # ==========================================================
 # EXPORT CSVS
 # ==========================================================
-
-OUTPUT_FOLDER = BASE_DIR
 
 def export_csv(filename, data):
 
@@ -453,6 +574,18 @@ def export_csv(filename, data):
         reverse=True
     )
 
+    shock_sorted = sorted(
+        data,
+        key=lambda x: x["ShockCombatScore"],
+        reverse=True
+    )
+
+    shock_value_sorted = sorted(
+        data,
+        key=lambda x: x["ShockValueScore"],
+        reverse=True
+    )
+
     combat_ranks = {
         row["Unit"]: i + 1
         for i, row in enumerate(combat_sorted)
@@ -463,6 +596,16 @@ def export_csv(filename, data):
         for i, row in enumerate(value_sorted)
     }
 
+    shock_ranks = {
+        row["Unit"]: i + 1
+        for i, row in enumerate(shock_sorted)
+    }
+
+    shock_value_ranks = {
+        row["Unit"]: i + 1
+        for i, row in enumerate(shock_value_sorted)
+    }
+
     export_data = []
 
     for row in combat_sorted:
@@ -471,14 +614,26 @@ def export_csv(filename, data):
 
         new_row["CombatRank"] = combat_ranks[row["Unit"]]
         new_row["ValueRank"] = value_ranks[row["Unit"]]
+        new_row["ShockRank"] = shock_ranks[row["Unit"]]
+        new_row["ShockValueRank"] = shock_value_ranks[row["Unit"]]
 
         export_data.append(new_row)
 
     fieldnames = (
-        ["CombatRank", "ValueRank"]
+        [
+            "CombatRank",
+            "ValueRank",
+            "ShockRank",
+            "ShockValueRank"
+        ]
         + [
             k for k in export_data[0].keys()
-            if k not in ["CombatRank", "ValueRank"]
+            if k not in [
+                "CombatRank",
+                "ValueRank",
+                "ShockRank",
+                "ShockValueRank"
+            ]
         ]
     )
 
